@@ -43,7 +43,11 @@ from transformers import (
 )
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
-from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
+from transformers.trainer_callback import (
+    CallbackHandler,
+    ExportableState,
+    PrinterCallback,
+)
 from transformers.utils import is_peft_available
 
 from ..core import masked_mean, masked_whiten
@@ -568,9 +572,35 @@ class PPOTrainer(Trainer):
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
                             pg_losses = -mb_advantage * ratio
-                            pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
-                            pg_loss_max = torch.max(pg_losses, pg_losses2)
-                            pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+                            if not self.args.use_sppo:
+                                pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                                pg_loss_max = torch.max(pg_losses, pg_losses2)
+                                pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+                            else:
+                                low_clip_mask_negative = ratio < self.args.sppo_low_clip_negative
+                                high_clip_mask_negative = ratio > self.args.sppo_high_clip_negative
+
+                                loss_low_clip_negative = -mb_advantage * self.args.sppo_low_clip_negative * logprobs_diff
+                                loss_high_clip_negative = -mb_advantage * self.args.sppo_high_clip_negative * logprobs_diff
+                                loss_no_clip_negative = pg_losses
+
+                                negative_loss = torch.where(low_clip_mask_negative, loss_low_clip_negative, loss_no_clip_negative)
+                                negative_loss = torch.where(high_clip_mask_negative, loss_high_clip_negative, negative_loss)
+
+                                low_clip_mask_positive = ratio < self.args.sppo_low_clip_positive
+                                high_clip_mask_positive = ratio > self.args.sppo_high_clip_positive
+
+                                loss_low_clip_positive = -mb_advantage * self.args.sppo_low_clip_positive * logprobs_diff
+                                loss_high_clip_positive = -mb_advantage * self.args.sppo_high_clip_positive * logprobs_diff
+
+                                positive_loss = torch.where(low_clip_mask_positive, loss_low_clip_positive, pg_losses)
+                                positive_loss = torch.where(high_clip_mask_positive, loss_high_clip_positive, positive_loss)
+
+                                positive_mask = (mb_advantage > 0).float()
+                                negative_mask = (mb_advantage <= 0).float()
+                                sppo_loss = positive_loss*positive_mask + negative_loss*negative_mask
+                                pg_loss = masked_mean(sppo_loss, ~padding_mask[micro_batch_inds])
+
                             loss = pg_loss + args.vf_coef * vf_loss
                             accelerator.backward(loss)
                             optimizer.step()
