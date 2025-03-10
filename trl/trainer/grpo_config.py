@@ -284,3 +284,34 @@ class GRPOConfig(TrainingArguments):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
+
+    is_on_policy: bool = field(
+        default=True,
+        metadata={"help": "Whether to use on-policy training \
+        (i.e. PPO) or off-policy training (i.e. DQN)."},
+    )
+
+    use_sppo: bool = field(
+        default=False,
+        metadata={"help": "Whether to use SPPO."},
+    )
+
+    sppo_low_clip_negative: float = field(
+        default=0.0,
+        metadata={"help": "Low clip for SPPO on negative advantage."},
+    )
+
+    sppo_high_clip_negative: float = field(
+        default=1.0,
+        metadata={"help": "High clip for SPPO on negative advantage."},
+    )
+
+    sppo_low_clip_positive: float = field(
+        default=1.0,
+        metadata={"help": "Low clip for SPPO on positive advantage."},
+    )
+
+    sppo_high_clip_positive: float = field(
+        default=1.0,
+        metadata={"help": "High clip for SPPO on positive advantage."},
+    )

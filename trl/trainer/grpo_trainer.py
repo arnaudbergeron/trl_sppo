@@ -312,7 +312,7 @@ class GRPOTrainer(Trainer):
 
         # Reference model
         self.beta = args.beta
-        if self.beta == 0.0:
+        if self.beta == 0.0 and self.is_on_policy:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
         elif is_deepspeed_zero3_enabled():
@@ -328,6 +328,7 @@ class GRPOTrainer(Trainer):
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            processing_class.pad_token = processing_class.eos_token
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -754,8 +755,13 @@ class GRPOTrainer(Trainer):
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
             # Regular generation path
-            with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
+            if self.is_on_policy:
+                with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+                    prompt_completion_ids = unwrapped_model.generate(
+                        prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                    )
+            else:
+                prompt_completion_ids = self.ref_model.generate(
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
 
@@ -780,9 +786,14 @@ class GRPOTrainer(Trainer):
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
+                if self.is_on_policy:
+                    old_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
+                else:
+                    old_per_token_logps = self._get_per_token_logps(
+                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
             else:
                 old_per_token_logps = None
 
@@ -912,6 +923,7 @@ class GRPOTrainer(Trainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
+            "rewards": rewards[process_slice],
         }
 
     @profiling_decorator
@@ -940,11 +952,45 @@ class GRPOTrainer(Trainer):
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
-        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        logprobs_diff = per_token_logps - old_per_token_logps
+        coef_1 = torch.exp(logprobs_diff)
+        
+
+        if not self.args.use_sppo:
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            is_clipped = (per_token_loss1 < per_token_loss2).float()
+
+        else:
+            scores = inputs["rewards"]
+            scores = scores.unsqueeze(1)
+            pg_losses = -scores * coef_1
+            low_clip_mask_negative = coef_1 < self.args.sppo_low_clip_negative
+            high_clip_mask_negative = coef_1 > self.args.sppo_high_clip_negative
+
+            loss_low_clip_negative = -scores * self.args.sppo_low_clip_negative * logprobs_diff
+            loss_high_clip_negative = -scores * self.args.sppo_high_clip_negative * logprobs_diff
+            loss_no_clip_negative = pg_losses
+
+            negative_loss = torch.where(low_clip_mask_negative, loss_low_clip_negative, loss_no_clip_negative)
+            negative_loss = torch.where(high_clip_mask_negative, loss_high_clip_negative, negative_loss)
+
+            low_clip_mask_positive = coef_1 < self.args.sppo_low_clip_positive
+            high_clip_mask_positive = coef_1 > self.args.sppo_high_clip_positive
+
+            loss_low_clip_positive = -scores * self.args.sppo_low_clip_positive * logprobs_diff
+            loss_high_clip_positive = -scores * self.args.sppo_high_clip_positive * logprobs_diff
+
+            positive_loss = torch.where(low_clip_mask_positive, loss_low_clip_positive, pg_losses)
+            positive_loss = torch.where(high_clip_mask_positive, loss_high_clip_positive, positive_loss)
+
+            positive_mask = (scores > 0).float()
+            negative_mask = (scores <= 0).float()
+            per_token_loss = positive_loss*positive_mask + negative_loss*negative_mask
+            is_clipped = (low_clip_mask_negative | high_clip_mask_negative).float() * negative_mask + (low_clip_mask_positive | high_clip_mask_positive).float() * positive_mask
+
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
@@ -956,7 +1002,6 @@ class GRPOTrainer(Trainer):
             mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
-        is_clipped = (per_token_loss1 < per_token_loss2).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
